@@ -1,33 +1,17 @@
 """
-スクリーンショットツール
-- ドラッグで撮影範囲を指定（マルチモニター対応）
+スクリーンショットツール (メインモニタ専用・動的スケール補正版)
+- ドラッグで撮影範囲を指定（メインモニタのみ）
 - F1キーで指定範囲をJPG保存（連番ファイル名）
 - グローバルホットキー対応：本アプリがアクティブでなくてもF1で撮影可能
 - スクリーンショットをExcelに縦順に自動貼り付け
-    * 貼り付け先のシートをユーザが指定可能（空欄なら先頭シート）
-    * 貼り付け開始位置（行・列）をユーザが指定可能（空欄なら 1行目・A列）
-    * シート毎に「次の貼り付け位置」を独立管理（メタシートで永続化）
 必要ライブラリ: pip install Pillow pynput openpyxl
 """
 
-import tkinter as tk
-from tkinter import filedialog, ttk
 import os
 import sys
-import math
-import threading
-from PIL import ImageGrab
-from pynput import keyboard as pynput_keyboard
 
-try:
-    from openpyxl import Workbook, load_workbook
-    from openpyxl.drawing.image import Image as XLImage
-    from openpyxl.utils import get_column_letter, column_index_from_string
-    OPENPYXL_AVAILABLE = True
-except ImportError:
-    OPENPYXL_AVAILABLE = False
-
-# ── Windows DPIスケーリング対策 ──────────────────────────────────────────────
+# ── 1. 最優先：Tkinterを読み込む前にWindowsのDPIスケーリングを無効化する ──
+# （※この記述が import tkinter より下に設定されていると無効になってしまうため、必ず先頭に配置）
 if sys.platform == "win32":
     try:
         import ctypes
@@ -44,6 +28,23 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# DPI設定を済ませてからUIライブラリを読み込む
+import tkinter as tk
+from tkinter import filedialog, ttk
+import math
+import threading
+from PIL import ImageGrab
+from pynput import keyboard as pynput_keyboard
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.drawing.image import Image as XLImage
+    from openpyxl.utils import get_column_letter, column_index_from_string
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+
+
 # ── カラーパレット ──────────────────────────────────────────────────────────
 BG       = "#1e1e2e"
 PANEL    = "#2a2a3e"
@@ -56,26 +57,6 @@ SUBTEXT  = "#94a3b8"
 BORDER   = "#3f3f5f"
 
 _META_SHEET = "_scrn_meta"
-
-
-def _virtual_screen_rect():
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            x = user32.GetSystemMetrics(76)
-            y = user32.GetSystemMetrics(77)
-            w = user32.GetSystemMetrics(78)
-            h = user32.GetSystemMetrics(79)
-            return (x, y, w, h)
-        except Exception:
-            pass
-    tmp = tk.Tk()
-    tmp.withdraw()
-    w = tmp.winfo_screenwidth()
-    h = tmp.winfo_screenheight()
-    tmp.destroy()
-    return (0, 0, w, h)
 
 
 # ── Windowsグローバルホットキー ────────────────────────────────────────────
@@ -146,25 +127,29 @@ class Win32GlobalHotkey:
 class RegionSelector:
     def __init__(self, parent, callback):
         self.callback = callback
-        self.start_x = self.start_y = 0
+        self.start_x = 0
+        self.start_y = 0
         self.rect_id = None
-        self._cx = self._cy = 0
-
-        vx, vy, vw, vh = _virtual_screen_rect()
+        
+        # メインモニタのサイズを取得
+        self.w = parent.winfo_screenwidth()
+        self.h = parent.winfo_screenheight()
 
         self.win = tk.Toplevel(parent)
         self.win.title("")
         self.win.overrideredirect(True)
-        self.win.geometry(f"{vw}x{vh}+{vx}+{vy}")
+        
+        # メインモニタの左上(+0+0)を起点にウィンドウを配置
+        self.win.geometry(f"{self.w}x{self.h}+0+0")
         self.win.attributes("-alpha", 0.35)
         self.win.attributes("-topmost", True)
         self.win.configure(bg="#000010")
         self.win.focus_force()
 
-        self.canvas = tk.Canvas(self.win, cursor="crosshair", bg="#000010", highlightthickness=0)
+        self.canvas = tk.Canvas(self.win, cursor="crosshair", bg="#000010", highlightthickness=0, borderwidth=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.create_text(
-            vw // 2, vh // 2,
+            self.w // 2, self.h // 2,
             text="ドラッグして撮影範囲を選択\n（Escキーでキャンセル）",
             fill="#ffffff", font=("Yu Gothic UI", 18, "bold"), justify="center", tags="hint",
         )
@@ -174,8 +159,10 @@ class RegionSelector:
         self.win.bind("<Escape>", self._cancel)
 
     def _on_press(self, event):
-        self.start_x, self.start_y = event.x_root, event.y_root
-        self._cx, self._cy = event.x, event.y
+        # キャンバス内の相対座標を取得
+        self.start_x = event.x
+        self.start_y = event.y
+
         self.canvas.delete("hint")
         if self.rect_id:
             self.canvas.delete(self.rect_id)
@@ -184,12 +171,14 @@ class RegionSelector:
     def _on_drag(self, event):
         if self.rect_id:
             self.canvas.delete(self.rect_id)
+        
         self.rect_id = self.canvas.create_rectangle(
-            self._cx, self._cy, event.x, event.y,
+            self.start_x, self.start_y, event.x, event.y,
             outline="#a78bfa", width=2, fill="#7c3aed", stipple="gray25", tags="sel",
         )
         self.canvas.delete("size_label")
-        w, h = abs(event.x_root - self.start_x), abs(event.y_root - self.start_y)
+        w = abs(event.x - self.start_x)
+        h = abs(event.y - self.start_y)
         self.canvas.create_text(
             event.x + 12, event.y + 12, text=f"{w} × {h}",
             fill="#ffffff", font=("Consolas", 11, "bold"), anchor="nw", tags="size_label",
@@ -197,10 +186,13 @@ class RegionSelector:
 
     def _on_release(self, event):
         region = (
-            min(self.start_x, event.x_root), min(self.start_y, event.y_root),
-            max(self.start_x, event.x_root), max(self.start_y, event.y_root),
+            min(self.start_x, event.x),
+            min(self.start_y, event.y),
+            max(self.start_x, event.x),
+            max(self.start_y, event.y),
         )
         self.win.destroy()
+        
         if (region[2] - region[0]) < 5 or (region[3] - region[1]) < 5:
             self.callback(None)
         else:
@@ -228,27 +220,19 @@ class ScreenshotApp:
         self._hotkey_mode  = "none"
         self._capturing    = False
 
-        # ── Excel出力関連 ──────────────────────────────────────────
         self.excel_enabled       = tk.BooleanVar(value=False)
         self.excel_path          = tk.StringVar(value="")
-        # 開始位置（ユーザ指定）— 指定しなければ 1行目・1列目（A1）
-        self.excel_start_row_var = tk.StringVar(value="1")   # 1-based行番号
-        self.excel_start_col_var = tk.StringVar(value="A")   # 列（英字 or 数字）
-        # シート名（空 = 先頭シートを使用）
+        self.excel_start_row_var = tk.StringVar(value="1")
+        self.excel_start_col_var = tk.StringVar(value="A")
         self.excel_sheet_var     = tk.StringVar(value="")
-        # 現在の貼り付け位置（内部管理）
         self.excel_row           = 1
         self.excel_col           = 1
-        # UI ↔ 内部値 の自動同期で無限ループを起こさないためのフラグ
         self._suppress_trace     = False
 
         self._build_ui()
-        # UI構築後にトレースを設定（UI値の変更を内部値へ自動反映）
         self._install_excel_traces()
         self._start_hotkey()
         self._sync_counter()
-
-    # ── UI構築 ─────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         root = self.root
@@ -263,7 +247,6 @@ class ScreenshotApp:
         body = tk.Frame(root, bg=BG)
         body.pack(fill=tk.BOTH, expand=True, padx=20, pady=12)
 
-        # ① 保存先
         self._section(body, "① 保存先フォルダ")
         row1 = tk.Frame(body, bg=BG)
         row1.pack(fill=tk.X, pady=(4, 0))
@@ -275,7 +258,6 @@ class ScreenshotApp:
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=(0, 8))
         self._btn(row1, "参照…", self._select_folder, small=True).pack(side=tk.LEFT)
 
-        # ② 撮影範囲
         self._section(body, "② 撮影範囲の指定")
         self.region_label = tk.Label(
             body, text="未設定", bg=PANEL, fg=SUBTEXT,
@@ -285,7 +267,6 @@ class ScreenshotApp:
         self.region_label.pack(fill=tk.X, pady=(4, 0))
         self._btn(body, "ドラッグで範囲を選択", self._start_region_select).pack(fill=tk.X, pady=(8, 0))
 
-        # ③ ショートカット
         self._section(body, "③ スクリーンショット")
         info = tk.Frame(body, bg=PANEL, relief=tk.FLAT, highlightbackground=BORDER, highlightthickness=1)
         info.pack(fill=tk.X, pady=(4, 0))
@@ -294,7 +275,6 @@ class ScreenshotApp:
             bg=PANEL, fg=ACCENT2, font=("Yu Gothic UI", 11, "bold"), pady=10,
         ).pack()
 
-        # ④ Excelへの貼り付け
         self._section(body, "④ Excelへの貼り付け")
 
         if not OPENPYXL_AVAILABLE:
@@ -308,7 +288,6 @@ class ScreenshotApp:
         else:
             self._build_excel_ui(body)
 
-        # ステータスバー
         self.status_var = tk.StringVar(value="準備完了")
         self.status_bar = tk.Label(
             root, textvariable=self.status_var,
@@ -318,7 +297,6 @@ class ScreenshotApp:
         self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
     def _build_excel_ui(self, body):
-        # 有効チェック
         tk.Checkbutton(
             body, text="スクリーンショットをExcelに縦順に貼り付ける",
             variable=self.excel_enabled,
@@ -328,7 +306,6 @@ class ScreenshotApp:
             command=self._on_excel_toggle,
         ).pack(fill=tk.X, pady=(4, 0))
 
-        # ファイル選択行
         row_f = tk.Frame(body, bg=BG)
         row_f.pack(fill=tk.X, pady=(4, 0))
         tk.Label(row_f, text="ファイル:", bg=BG, fg=SUBTEXT,
@@ -342,7 +319,6 @@ class ScreenshotApp:
         self._btn(row_f, "参照", self._select_excel, small=True).pack(side=tk.LEFT, padx=(0, 4))
         self._btn(row_f, "新規", self._new_excel,    small=True).pack(side=tk.LEFT)
 
-        # シート選択行
         row_s = tk.Frame(body, bg=BG)
         row_s.pack(fill=tk.X, pady=(4, 0))
         tk.Label(row_s, text="シート:", bg=BG, fg=SUBTEXT,
@@ -356,7 +332,6 @@ class ScreenshotApp:
         tk.Label(row_s, text="（空欄=先頭シート / 存在しない名前=新規作成）",
                  bg=BG, fg=SUBTEXT, font=("Yu Gothic UI", 8)).pack(side=tk.LEFT, padx=(6, 0))
 
-        # 開始位置行
         row_p = tk.Frame(body, bg=BG)
         row_p.pack(fill=tk.X, pady=(4, 0))
         tk.Label(row_p, text="開始位置:", bg=BG, fg=SUBTEXT,
@@ -383,7 +358,6 @@ class ScreenshotApp:
         tk.Label(row_p, text="（例: A, B, 1, 2）",
                  bg=BG, fg=SUBTEXT, font=("Yu Gothic UI", 8)).pack(side=tk.LEFT)
 
-        # 現在位置 + リセット
         row_c = tk.Frame(body, bg=BG)
         row_c.pack(fill=tk.X, pady=(6, 0))
         self.excel_status_var = tk.StringVar(value="次の貼り付け位置: 列 A 行 1")
@@ -408,16 +382,12 @@ class ScreenshotApp:
             font=font, padx=10 if small else 0, pady=4 if small else 8, borderwidth=0,
         )
 
-    # ── フォルダ選択 ────────────────────────────────────────────────────────
-
     def _select_folder(self):
         path = filedialog.askdirectory(initialdir=self.save_dir.get())
         if path:
             self.save_dir.set(path)
             self._sync_counter()
             self._set_status(f"保存先: {path}", SUCCESS)
-
-    # ── 範囲選択 ────────────────────────────────────────────────────────────
 
     def _start_region_select(self):
         self.root.withdraw()
@@ -436,8 +406,6 @@ class ScreenshotApp:
             self._set_status("撮影範囲を設定しました。F1キーで撮影できます。", SUCCESS)
         else:
             self._set_status("範囲の選択がキャンセルされました", WARNING)
-
-    # ── Excel関連 ──────────────────────────────────────────────────────────
 
     def _on_excel_toggle(self):
         if self.excel_enabled.get() and not self.excel_path.get():
@@ -475,7 +443,6 @@ class ScreenshotApp:
                 self._set_status(f"⚠ Excel作成エラー: {e}", WARNING)
 
     def _populate_sheet_list(self, path):
-        """Excelファイルのシート名一覧をコンボボックスに反映する"""
         if not hasattr(self, "sheet_combo"):
             return
         try:
@@ -487,7 +454,6 @@ class ScreenshotApp:
             self.sheet_combo["values"] = []
 
     def _parse_col(self, col_str):
-        """列指定文字列（'A'/'B'/... または '1'/'2'/...）を列番号(int)に変換する"""
         s = col_str.strip().upper()
         if not s:
             return 1
@@ -499,23 +465,16 @@ class ScreenshotApp:
             return 1
 
     def _first_data_sheet_name(self, wb):
-        """メタシートを除く先頭シートの名前を返す"""
         for s in wb.sheetnames:
             if s != _META_SHEET:
                 return s
-        # データシートが無い場合は最初のシート名（メタしかない異常系）
         return wb.sheetnames[0] if wb.sheetnames else "Sheet1"
 
     def _read_meta_for_sheet(self, wb, sheet_name):
-        """メタシートから指定シートの「次の貼り付け位置」を読み出して内部変数とUIに反映する。
-        新形式: 1行目=ヘッダ ["sheet", "row", "col"]、2行目以降=シート毎レコード。
-        旧形式: A1=行(数値), B1=列(数値) の単一保存（互換読み込み）。
-        戻り値: 復元できたら True、なければ False。"""
         if _META_SHEET not in wb.sheetnames:
             return False
         meta = wb[_META_SHEET]
 
-        # 新形式を優先して検索
         for row_idx in range(1, meta.max_row + 1):
             v0 = meta.cell(row=row_idx, column=1).value
             v1 = meta.cell(row=row_idx, column=2).value
@@ -527,7 +486,6 @@ class ScreenshotApp:
                 self._sync_ui_from_internal()
                 return True
 
-        # 旧形式（A1=行, B1=列の単一ペア）にフォールバック
         a1 = meta["A1"].value
         b1 = meta["B1"].value
         if isinstance(a1, int) and isinstance(b1, int):
@@ -539,8 +497,6 @@ class ScreenshotApp:
         return False
 
     def _load_excel_state(self, path):
-        """既存Excelファイルから、現在選択中のシートに対応する次の貼り付け位置を復元する。
-        メタシートに該当シートの記録が無ければUIで指定された開始位置を適用する。"""
         sheet_name = self.excel_sheet_var.get().strip()
         try:
             wb = load_workbook(path)
@@ -554,7 +510,6 @@ class ScreenshotApp:
             self._apply_start_position()
 
     def _apply_start_position(self):
-        """UIの開始位置設定を内部変数に適用する（指定が空・不正なら 1行・A列）"""
         try:
             self.excel_row = max(1, int(self.excel_start_row_var.get()))
         except (ValueError, TypeError):
@@ -563,8 +518,6 @@ class ScreenshotApp:
         self._update_excel_status()
 
     def _sync_ui_from_internal(self):
-        """内部の excel_row / excel_col をUI（StringVar）に書き戻す。
-        トレースによる無限ループを防ぐため _suppress_trace を立てる。"""
         self._suppress_trace = True
         try:
             self.excel_start_row_var.set(str(self.excel_row))
@@ -573,25 +526,20 @@ class ScreenshotApp:
             self._suppress_trace = False
 
     def _save_excel_state(self, wb, sheet_name):
-        """次の貼り付け行・列を、シート名と紐づけてメタシートに保存する（新形式）"""
         if _META_SHEET not in wb.sheetnames:
             meta = wb.create_sheet(_META_SHEET)
-            # ヘッダを書き込み
             meta.cell(row=1, column=1, value="sheet")
             meta.cell(row=1, column=2, value="row")
             meta.cell(row=1, column=3, value="col")
         else:
             meta = wb[_META_SHEET]
-            # ヘッダが無ければ追加（旧形式からの移行）
             if not (isinstance(meta.cell(row=1, column=1).value, str)
                     and meta.cell(row=1, column=1).value == "sheet"):
-                # 旧形式の単一値は破棄し、新形式に置き換える
                 meta.delete_rows(1, meta.max_row)
                 meta.cell(row=1, column=1, value="sheet")
                 meta.cell(row=1, column=2, value="row")
                 meta.cell(row=1, column=3, value="col")
 
-        # 既存レコードを更新、無ければ追記
         target_row = None
         for r in range(2, meta.max_row + 1):
             if meta.cell(row=r, column=1).value == sheet_name:
@@ -606,27 +554,18 @@ class ScreenshotApp:
         meta.sheet_state = "hidden"
 
     def _reset_excel_row(self):
-        """位置を A1（行=1・列=A）に強制初期化する。
-        UI上の開始位置入力欄も "1" / "A" に書き戻す。"""
-        # UIに直接書き戻す（トレース経由の再帰反映を抑止して一括更新）
         self._suppress_trace = True
         try:
             self.excel_start_row_var.set("1")
             self.excel_start_col_var.set("A")
         finally:
             self._suppress_trace = False
-        # 内部値も明示的に A1 に揃える
         self.excel_row = 1
         self.excel_col = 1
         self._update_excel_status()
         self._set_status("Excel貼り付け位置を A1（行 1・列 A）に初期化しました", SUCCESS)
 
-    # ── UI変更を内部値へ即時反映するためのトレース ───────────────────────────
-
     def _install_excel_traces(self):
-        """UI（行・列・シート）の変更を内部値へ自動的に反映するためのトレースを登録する。
-        これにより、ユーザがUIで開始位置やシートを変更すると、次の撮影で即座にその設定が
-        使われる（「位置リセット」ボタンを押す手間が不要になる）。"""
         if not OPENPYXL_AVAILABLE:
             return
         self.excel_start_row_var.trace_add("write", self._on_start_pos_changed)
@@ -634,19 +573,15 @@ class ScreenshotApp:
         self.excel_sheet_var.trace_add("write", self._on_sheet_changed)
 
     def _on_start_pos_changed(self, *_args):
-        """行・列のUI値が変更されたら内部 excel_row / excel_col に反映する"""
         if self._suppress_trace:
             return
         self._apply_start_position()
 
     def _on_sheet_changed(self, *_args):
-        """シート選択が変わったら、そのシートに保存されている貼り付け位置を再ロードする。
-        対象シートに記録が無ければ、UIの開始位置設定を適用する。"""
         if self._suppress_trace:
             return
         path = self.excel_path.get()
         sheet_name = self.excel_sheet_var.get().strip()
-        # ファイル未指定 or 未作成: UI値だけ反映
         if not path or not os.path.exists(path):
             self._apply_start_position()
             return
@@ -667,22 +602,17 @@ class ScreenshotApp:
             self.excel_status_var.set(f"次の貼り付け位置: 列 {col_letter} 行 {self.excel_row} ")
 
     def _get_or_create_sheet(self, wb, sheet_name):
-        """シート名に対応するシートを返す。空欄ならアクティブシートを使用し、
-        存在しない名前なら新規作成する。"""
         if not sheet_name:
             ws = wb.active
-            # アクティブシートがメタシートの場合は別シートを探す
             if ws.title == _META_SHEET:
                 others = [s for s in wb.sheetnames if s != _META_SHEET]
                 ws = wb[others[0]] if others else wb.create_sheet("Sheet1")
             return ws
         if sheet_name in wb.sheetnames:
             return wb[sheet_name]
-        # 新規シートを作成（メタシートの前に挿入）
         return wb.create_sheet(sheet_name)
 
     def _paste_to_excel(self, filepath, img_width_px, img_height_px):
-        """撮影したJPGをExcelの現在行に貼り付け、次の行へ進める"""
         if not self.excel_enabled.get():
             return
         if not OPENPYXL_AVAILABLE:
@@ -693,8 +623,6 @@ class ScreenshotApp:
             self._set_status("⚠ Excelファイルを指定してください", WARNING)
             return
 
-        # 念のため、最新のUI値を内部に反映してから貼り付ける
-        # （トレースで通常は同期済みだが、初回起動直後など保険として）
         if self.excel_row < 1 or self.excel_col < 1:
             self._apply_start_position()
 
@@ -708,7 +636,6 @@ class ScreenshotApp:
 
             ws = self._get_or_create_sheet(wb, sheet_name)
 
-            # アンカー: 列文字 + 行番号
             col_letter = get_column_letter(self.excel_col)
             anchor = f"{col_letter}{self.excel_row}"
 
@@ -716,18 +643,13 @@ class ScreenshotApp:
             xl_img.anchor = anchor
             ws.add_image(xl_img)
 
-            # 画像が占める行数を計算（1pt ≈ 1.333px、デフォルト行高 15pt）
             rows_consumed = max(1, math.ceil(img_height_px * 0.75 / 15.0))
-
-            # 列幅を画像幅に合わせて広げる（既存より狭い場合のみ）
             col_width = img_width_px / 7.0
             if ws.column_dimensions[col_letter].width is None \
                     or ws.column_dimensions[col_letter].width < col_width:
                 ws.column_dimensions[col_letter].width = col_width
 
-            # 次の貼り付け行へ（1行空白を挟む）
             self.excel_row += rows_consumed + 1
-            # 実際に使われたシート名で保存（シート毎に独立管理）
             self._save_excel_state(wb, ws.title)
             wb.save(xl_path)
 
@@ -739,8 +661,6 @@ class ScreenshotApp:
             )
         except Exception as e:
             self._set_status(f"⚠ Excel貼り付けエラー: {e}", WARNING)
-
-    # ── F1ホットキー ────────────────────────────────────────────────────────
 
     def _start_hotkey(self):
         if sys.platform == "win32":
@@ -773,8 +693,6 @@ class ScreenshotApp:
             self.root.after(0, self._take_screenshot)
         except Exception:
             pass
-
-    # ── スクリーンショット撮影 ───────────────────────────────────────────────
 
     def _take_screenshot(self):
         if self._capturing:
@@ -812,10 +730,29 @@ class ScreenshotApp:
 
     def _do_capture(self, filepath, filename, was_visible):
         try:
-            try:
-                img = ImageGrab.grab(bbox=self.region, all_screens=True)
-            except TypeError:
-                img = ImageGrab.grab(bbox=self.region)
+            # 1. ドラッグで取得した座標
+            x1, y1, x2, y2 = self.region
+            
+            # 2. Tkinterが認識しているメインモニタの解像度
+            logical_w = self.root.winfo_screenwidth()
+            logical_h = self.root.winfo_screenheight()
+
+            # 3. Pillowでメインモニタ全体を撮影し、実際の物理解像度を取得
+            full_img = ImageGrab.grab()
+            physical_w, physical_h = full_img.size
+
+            # 4. 【核心部】解像度のズレ（Windowsの125%, 150%等の表示スケール）を吸収する比率を計算
+            scale_x = physical_w / logical_w
+            scale_y = physical_h / logical_h
+
+            # 5. Tkinterで取得した選択座標を、実際の画像ピクセル座標に補正
+            rx1 = int(x1 * scale_x)
+            ry1 = int(y1 * scale_y)
+            rx2 = int(x2 * scale_x)
+            ry2 = int(y2 * scale_y)
+
+            # 6. 補正した座標で切り抜き
+            img = full_img.crop((rx1, ry1, rx2, ry2))
 
             img.save(filepath, "JPEG", quality=95)
             self._set_status(f"✓ 保存完了: {filename}  [{img.width}×{img.height}px]", SUCCESS)
@@ -834,8 +771,6 @@ class ScreenshotApp:
     def _show_flash(self):
         self.status_bar.config(bg=ACCENT)
         self.root.after(150, lambda: self.status_bar.config(bg=PANEL))
-
-    # ── ユーティリティ ──────────────────────────────────────────────────────
 
     def _sync_counter(self):
         d = self.save_dir.get()
