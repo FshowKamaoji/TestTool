@@ -1,10 +1,11 @@
 """
-スクリーンショットツール (メインモニタ専用・動的スケール補正版)
+スクリーンショットツール (メインモニタ専用・動的スケール補正・完全固定版)
 - ドラッグで撮影範囲を指定（メインモニタのみ）
 - F1キーで指定範囲をJPG保存（連番ファイル名）
 - グローバルホットキー対応：本アプリがアクティブでなくてもF1で撮影可能
 - スクリーンショットをExcelに縦順に自動貼り付け
     * 貼り付け先のシート、開始位置、画像間の空き行数を指定可能
+    * 画像の直上に元ファイル名を自動で記録
 必要ライブラリ: pip install Pillow pynput openpyxl
 """
 
@@ -12,7 +13,6 @@ import os
 import sys
 
 # ── 1. 最優先：Tkinterを読み込む前にWindowsのDPIスケーリングを無効化する ──
-# （※この記述が import tkinter より下に設定されていると無効になってしまうため、必ず先頭に配置）
 if sys.platform == "win32":
     try:
         import ctypes
@@ -34,7 +34,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 import math
 import threading
-from PIL import ImageGrab
+from PIL import Image as PILImage, ImageGrab
 from pynput import keyboard as pynput_keyboard
 
 try:
@@ -160,7 +160,6 @@ class RegionSelector:
         self.win.bind("<Escape>", self._cancel)
 
     def _on_press(self, event):
-        # キャンバス内の相対座標を取得
         self.start_x = event.x
         self.start_y = event.y
 
@@ -221,12 +220,12 @@ class ScreenshotApp:
         self._hotkey_mode  = "none"
         self._capturing    = False
 
-        self.excel_enabled       = tk.BooleanVar(value=False)
+        self.excel_enabled       = tk.BooleanVar(value=True)
         self.excel_path          = tk.StringVar(value="")
         self.excel_start_row_var = tk.StringVar(value="1")
         self.excel_start_col_var = tk.StringVar(value="A")
         self.excel_sheet_var     = tk.StringVar(value="")
-        self.excel_gap_var       = tk.StringVar(value="1")  # 画像間の空き行数
+        self.excel_gap_var       = tk.StringVar(value="5")  # 画像間の空き行数
         self.excel_row           = 1
         self.excel_col           = 1
         self._suppress_trace     = False
@@ -659,9 +658,15 @@ class ScreenshotApp:
                 wb = Workbook()
 
             ws = self._get_or_create_sheet(wb, sheet_name)
-
             col_letter = get_column_letter(self.excel_col)
-            anchor = f"{col_letter}{self.excel_row}"
+            
+            # 直上のセルにファイル名テキストを入力
+            filename = os.path.basename(filepath)
+            ws.cell(row=self.excel_row, column=self.excel_col, value=filename)
+
+            # 画像はその「1行下」から貼り付ける
+            img_start_row = self.excel_row + 1
+            anchor = f"{col_letter}{img_start_row}"
 
             xl_img = XLImage(filepath)
             
@@ -672,52 +677,34 @@ class ScreenshotApp:
             xl_img.anchor = anchor
             ws.add_image(xl_img)
 
-            # 【根本解決】固定値による割り算を廃止し、実際の「物理的な行の高さ」をループで積算して判定する
-            try:
-                sheet_format = getattr(ws, "sheet_format", None)
-                if sheet_format and sheet_format.defaultRowHeight:
-                    default_rh_pt = float(sheet_format.defaultRowHeight)
-                else:
-                    default_rh_pt = 13.5
-            except Exception:
-                default_rh_pt = 13.5
+            # 【根本解決】Excelの環境依存(DPIやフォント)による行の高さのブレを防ぐため、
+            # プログラム側で強制的に行の高さを18.0ポイント(24px)に固定する。
+            FIXED_ROW_HEIGHT_PT = 18.0
             
-            if default_rh_pt <= 0:
-                default_rh_pt = 13.5
-
-            # 画像がExcel上で占有する物理的な高さ（ポイント）
-            # openpyxlでは xl_img にセットしたピクセル値 × 0.75 がポイント換算の高さになります
+            # 画像の高さ(ポイント)
             img_height_pt = logical_height_px * 0.75
+            
+            # 画像が消費する物理行数を計算（切り上げ）
+            rows_consumed = max(1, math.ceil(img_height_pt / FIXED_ROW_HEIGHT_PT))
+            
+            # ファイル名の行、画像が配置される行、および空き行(gap)の高さをすべて固定
+            total_rows_to_format = 1 + rows_consumed + gap
+            for i in range(total_rows_to_format):
+                r = self.excel_row + i
+                ws.row_dimensions[r].height = FIXED_ROW_HEIGHT_PT
 
-            current_row = self.excel_row
-            remaining_pt = img_height_pt
-
-            # 画像が物理的に何行目まで覆いかぶさるかをシートの行ごとに計測
-            while remaining_pt > 0:
-                rh = None
-                if current_row in ws.row_dimensions:
-                    rh = ws.row_dimensions[current_row].height
-                
-                if rh is None:
-                    rh = default_rh_pt
-                else:
-                    rh = float(rh)
-                
-                remaining_pt -= rh
-                current_row += 1
-
+            # セルの列幅も画像サイズに合わせて調整
             col_width = logical_width_px / 7.0
             if ws.column_dimensions[col_letter].width is None \
                     or ws.column_dimensions[col_letter].width < col_width:
                 ws.column_dimensions[col_letter].width = col_width
 
-            # current_row は画像が完全に終わった次の「安全な行」。そこに空き行(gap)を足す。
-            self.excel_row = current_row + gap
+            # 次の開始行（画像開始行 + 画像消費行数 + 空き行）
+            self.excel_row = img_start_row + rows_consumed + gap
             
             self._save_excel_state(wb, ws.title)
             wb.save(xl_path)
 
-            # 【重要修正】UIの「開始位置」にも現在の位置を同期させ、UI起因の行数巻き戻りバグを防ぐ
             self._sync_ui_from_internal()
             self._update_excel_status()
 
@@ -818,18 +805,29 @@ class ScreenshotApp:
             rx2 = int(x2 * scale_x)
             ry2 = int(y2 * scale_y)
 
-            # 6. 補正した座標で切り抜き
+            # 6. 補正した座標で物理サイズの画像を切り抜き
             img = full_img.crop((rx1, ry1, rx2, ry2))
 
-            img.save(filepath, "JPEG", quality=95)
+            # 7. 物理画像をドラッグ時の「見た目のサイズ(論理ピクセル)」にリサイズする
+            logical_w_px = max(1, abs(x2 - x1))
+            logical_h_px = max(1, abs(y2 - y1))
+            
+            if logical_w_px != img.width or logical_h_px != img.height:
+                if hasattr(PILImage, "Resampling"):
+                    resample_filter = PILImage.Resampling.LANCZOS
+                else:
+                    resample_filter = PILImage.LANCZOS
+                img = img.resize((logical_w_px, logical_h_px), resample_filter)
+
+            # 【重要】Excel側で勝手に画像が巨大化しないように、DPIを96に強制固定して保存する
+            img.save(filepath, "JPEG", quality=95, dpi=(96, 96))
+            
             self._set_status(f"✓ 保存完了: {filename}  [{img.width}×{img.height}px]", SUCCESS)
             self.counter += 1
             self._show_flash()
 
-            # Excelの表示サイズを合わせるために、ドラッグ時の見た目のサイズ(論理ピクセル)を渡す
-            logical_w_px = abs(x2 - x1)
-            logical_h_px = abs(y2 - y1)
-            self._paste_to_excel(filepath, logical_w_px, logical_h_px)
+            # リサイズ済みの物理的な幅・高さを渡す（これが論理サイズと同一になっている）
+            self._paste_to_excel(filepath, img.width, img.height)
 
         except Exception as e:
             self._set_status(f"⚠ 撮影エラー: {e}", WARNING)
