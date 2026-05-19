@@ -677,20 +677,34 @@ class ScreenshotApp:
             xl_img.anchor = anchor
             ws.add_image(xl_img)
 
-            # 【根本解決】Excelの環境依存(DPIやフォント)による行の高さのブレを防ぐため、
-            # プログラム側で強制的に行の高さを18.0ポイント(24px)に固定する。
+            # 【根本解決】gap行数が正確に反映されない問題の修正。
+            # 原因: 行高さを18ptで固定しても、Excelの実際の描画環境（DPI・フォント等）により
+            #       行の高さが異なる場合、rows_consumedと実際に画像が占める行数がズレる。
+            # 修正: 画像行の高さを「画像がrows_consumed行にぴったり収まる値」から逆算して設定する。
+            #       これにより環境依存のブレを排除し、gap行数が常に正確になる。
             FIXED_ROW_HEIGHT_PT = 18.0
-            
-            # 画像の高さ(ポイント)
+
+            # 画像の高さ(ポイント): 1px = 0.75pt (96dpi基準)
             img_height_pt = logical_height_px * 0.75
-            
+
             # 画像が消費する物理行数を計算（切り上げ）
             rows_consumed = max(1, math.ceil(img_height_pt / FIXED_ROW_HEIGHT_PT))
-            
-            # ファイル名の行、画像が配置される行、および空き行(gap)の高さをすべて固定
-            total_rows_to_format = 1 + rows_consumed + gap
-            for i in range(total_rows_to_format):
-                r = self.excel_row + i
+
+            # 画像行の高さを逆算: rows_consumed行で画像がぴったり収まる高さ
+            # 例) 画像300px → img_height_pt=225pt, rows_consumed=13 → 各行=17.307...pt
+            img_row_height_pt = img_height_pt / rows_consumed
+
+            # ファイル名行の高さを固定
+            ws.row_dimensions[self.excel_row].height = FIXED_ROW_HEIGHT_PT
+
+            # 画像行の高さを逆算値で固定（画像がぴったり収まる）
+            for i in range(rows_consumed):
+                r = self.excel_row + 1 + i
+                ws.row_dimensions[r].height = img_row_height_pt
+
+            # gap行の高さを固定
+            for i in range(gap):
+                r = self.excel_row + 1 + rows_consumed + i
                 ws.row_dimensions[r].height = FIXED_ROW_HEIGHT_PT
 
             # セルの列幅も画像サイズに合わせて調整
