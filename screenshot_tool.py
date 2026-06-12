@@ -650,7 +650,8 @@ class ScreenshotApp:
                 gap = int(self.excel_gap_var.get())
                 gap = max(0, gap)
             except ValueError:
-                gap = 1
+                # 【修正】不正値時のフォールバックをUI初期値(5)と統一（旧: 1 で不整合だった）
+                gap = 5
 
             if os.path.exists(xl_path):
                 wb = load_workbook(xl_path)
@@ -677,30 +678,37 @@ class ScreenshotApp:
             xl_img.anchor = anchor
             ws.add_image(xl_img)
 
-            # 【根本解決】gap行数が正確に反映されない問題の修正。
-            # 原因: 行高さを18ptで固定しても、Excelの実際の描画環境（DPI・フォント等）により
-            #       行の高さが異なる場合、rows_consumedと実際に画像が占める行数がズレる。
-            # 修正: 画像行の高さを「画像がrows_consumed行にぴったり収まる値」から逆算して設定する。
-            #       これにより環境依存のブレを排除し、gap行数が常に正確になる。
-            FIXED_ROW_HEIGHT_PT = 18.0
-
-            # 画像の高さ(ポイント): 1px = 0.75pt (96dpi基準)
-            img_height_pt = logical_height_px * 0.75
+            # 【根本修正】行間隔(gap)が環境によってズレる問題の修正。
+            # 原因: 旧実装は画像行の高さを img_height_pt / rows_consumed で「逆算」しており、
+            #       端数を含む行高さ(例: 17.3077pt)を全行に設定していた。
+            #       Excelは行高さを整数ピクセル(=0.75ptの倍数)に丸めて描画するため、
+            #       1行あたり最大±0.5pxの丸め誤差が行数分蓄積し、画像下端と行境界が
+            #       ズレて gap 行数が環境(DPI・ズーム)によって不正確になっていた。
+            # 修正: 設定するすべての行高さを「整数ピクセル相当(0.75ptの倍数)」に量子化する。
+            #       ・画像行は 1行 = 18pt(=24px) 固定
+            #       ・最終画像行のみ「残りピクセル × 0.75pt」とし、画像行の合計高さ(px)を
+            #         画像の高さ(px)と完全一致させる
+            #       これにより丸め誤差が一切発生せず、gap行数が常に正確になる。
+            FIXED_ROW_HEIGHT_PT = 18.0   # = 24px (18 / 0.75)。整数ピクセルなので丸めが起きない
+            PX_PER_ROW = 24              # 1画像行が占めるピクセル数
 
             # 画像が消費する物理行数を計算（切り上げ）
-            rows_consumed = max(1, math.ceil(img_height_pt / FIXED_ROW_HEIGHT_PT))
+            rows_consumed = max(1, math.ceil(logical_height_px / PX_PER_ROW))
 
-            # 画像行の高さを逆算: rows_consumed行で画像がぴったり収まる高さ
-            # 例) 画像300px → img_height_pt=225pt, rows_consumed=13 → 各行=17.307...pt
-            img_row_height_pt = img_height_pt / rows_consumed
+            # 最終行が受け持つ残りピクセル数（1〜24px の整数。整数px × 0.75pt = 丸め誤差ゼロ）
+            last_row_px = logical_height_px - PX_PER_ROW * (rows_consumed - 1)
+            last_row_px = max(1, min(PX_PER_ROW, last_row_px))
 
             # ファイル名行の高さを固定
             ws.row_dimensions[self.excel_row].height = FIXED_ROW_HEIGHT_PT
 
-            # 画像行の高さを逆算値で固定（画像がぴったり収まる）
+            # 画像行の高さを設定（最終行以外は18pt固定、最終行は残りpxちょうど）
             for i in range(rows_consumed):
                 r = self.excel_row + 1 + i
-                ws.row_dimensions[r].height = img_row_height_pt
+                if i < rows_consumed - 1:
+                    ws.row_dimensions[r].height = FIXED_ROW_HEIGHT_PT
+                else:
+                    ws.row_dimensions[r].height = last_row_px * 0.75
 
             # gap行の高さを固定
             for i in range(gap):
@@ -708,7 +716,9 @@ class ScreenshotApp:
                 ws.row_dimensions[r].height = FIXED_ROW_HEIGHT_PT
 
             # セルの列幅も画像サイズに合わせて調整
-            col_width = logical_width_px / 7.0
+            # 【修正】Excelの実換算式(表示px ≒ 列幅×7 + 5)に基づき (px - 5) / 7 で算出
+            #         （旧: px / 7.0 では列が画像より約5px広くなっていた）
+            col_width = max(1.0, (logical_width_px - 5) / 7.0)
             if ws.column_dimensions[col_letter].width is None \
                     or ws.column_dimensions[col_letter].width < col_width:
                 ws.column_dimensions[col_letter].width = col_width
@@ -787,7 +797,10 @@ class ScreenshotApp:
         self._capturing = True
         was_visible = False
         try:
-            if self.root.state() == "normal" and self.root.focus_displayof() is not None:
+            # 【修正】旧実装は「可視かつフォーカスあり」のときだけ退避していたため、
+            #         可視・非フォーカス状態で撮影範囲と重なると自ウィンドウが写り込んだ。
+            #         可視状態なら常に退避する（撮影後に元へ復元）。
+            if self.root.state() == "normal":
                 was_visible = True
                 self.root.withdraw()
         except Exception:
@@ -814,10 +827,19 @@ class ScreenshotApp:
             scale_y = physical_h / logical_h
 
             # 5. Tkinterで取得した選択座標を、実際の画像ピクセル座標に補正
-            rx1 = int(x1 * scale_x)
-            ry1 = int(y1 * scale_y)
-            rx2 = int(x2 * scale_x)
-            ry2 = int(y2 * scale_y)
+            # 【修正】補正後の座標を物理解像度の範囲(0〜physical_w/h)にクランプする。
+            #         画面端ぎりぎりを選択した際、丸め誤差で座標が画像範囲を超えると
+            #         切り抜き結果に黒帯が混入するため。
+            rx1 = max(0, min(physical_w, int(round(x1 * scale_x))))
+            ry1 = max(0, min(physical_h, int(round(y1 * scale_y))))
+            rx2 = max(0, min(physical_w, int(round(x2 * scale_x))))
+            ry2 = max(0, min(physical_h, int(round(y2 * scale_y))))
+
+            # クランプの結果サイズが0にならないように最低1pxを保証
+            if rx2 <= rx1:
+                rx2 = min(physical_w, rx1 + 1)
+            if ry2 <= ry1:
+                ry2 = min(physical_h, ry1 + 1)
 
             # 6. 補正した座標で物理サイズの画像を切り抜き
             img = full_img.crop((rx1, ry1, rx2, ry2))
